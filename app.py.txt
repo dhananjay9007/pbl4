@@ -1,0 +1,366 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import altair as alt
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.metrics import accuracy_score, mean_squared_error, r2_score
+from mlxtend.preprocessing import TransactionEncoder
+from mlxtend.frequent_patterns import apriori, association_rules
+
+# Set page config
+st.set_page_config(layout="wide")
+
+# --- Data Loading ---
+@st.cache_data
+def load_data(filepath):
+    """
+Loads and cleans the survey data."""
+    df = pd.read_csv(filepath)
+    
+    # Clean up column names for easier use
+    df.columns = df.columns.str.replace(' ', '_').str.replace('[^A-Za-z0-9_]+', '', regex=True)
+    
+    # Fix a specific problematic column name if it exists
+    if 'barrier_Health_reasons_frequent_bathroom_trips_etc' in df.columns:
+        df = df.rename(columns={
+            'barrier_Health_reasons_frequent_bathroom_trips_etc': 'barrier_Health_reasons_freq_bathroom'
+        })
+        
+    # Convert income to an ordered categorical type for better processing
+    # (Handling potential 'Prefer not to say' or other non-numeric values)
+    income_levels = [
+        'Less than $25,000', '$25,000 - $49,999', '$50,000 - $74,999',
+        '$75,000 - $99,999', '$100,000 - $124,999', '$125,000 - $149,999',
+        '$150,000 - $199,999', '$200,000 or more', 'Prefer not to say'
+    ]
+    # Filter out levels not present in the data to avoid errors
+    valid_income_levels = [level for level in income_levels if level in df['income'].unique()]
+    if valid_income_levels:
+        df['income'] = pd.Categorical(df['income'], categories=valid_income_levels, ordered=True)
+
+    # Convert purchase_likelihood to a simpler target variable (e.g., 1 for purchase, 0 for not)
+    # This simplifies the classification problem
+    positive_responses = ['Definitely would purchase', 'Probably would purchase']
+    df['target_purchase'] = df['purchase_likelihood'].apply(lambda x: 1 if x in positive_responses else 0)
+
+    return df
+
+try:
+    df = load_data('survey_data.csv.csv')
+except FileNotFoundError:
+    st.error("Error: The file 'survey_data.csv.csv' was not found.")
+    st.stop()
+
+
+# --- Sidebar Filters ---
+st.sidebar.title("Dashboard Filters")
+st.sidebar.header("Data Visualization Filters")
+
+# Get unique values for filters, handling potential NaNs
+def get_unique_values(column_name):
+    if column_name in df.columns:
+        return ['All'] + df[column_name].dropna().unique().tolist()
+    return ['All']
+
+age_filter = st.sidebar.selectbox("Age Group", get_unique_values('age_group'))
+gender_filter = st.sidebar.selectbox("Gender", get_unique_values('gender'))
+income_filter = st.sidebar.selectbox("Income", get_unique_values('income'))
+
+# Apply filters
+filtered_df = df.copy()
+if age_filter != 'All':
+    filtered_df = filtered_df[filtered_df['age_group'] == age_filter]
+if gender_filter != 'All':
+    filtered_df = filtered_df[filtered_df['gender'] == gender_filter]
+if income_filter != 'All':
+    filtered_df = filtered_df[filtered_df['income'] == income_filter]
+
+if filtered_df.empty:
+    st.warning("No data matches the selected filters.")
+    st.stop()
+
+# --- Main Page ---
+st.title("Survey Data Analysis Dashboard")
+
+# Create tabs for each analysis
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "📊 Data Visualization",
+    "🎯 Classification",
+    "📈 Regression",
+    "🧩 Clustering",
+    "🛒 Association Rules"
+])
+
+# --- Tab 1: Data Visualization ---
+with tab1:
+    st.header("Filtered Data Visualizations")
+    st.write(f"Showing data for **{len(filtered_df)}** respondents.")
+
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Purchase Likelihood")
+        if 'purchase_likelihood' in filtered_df.columns:
+            chart = alt.Chart(filtered_df).mark_bar().encode(
+                x=alt.X('purchase_likelihood', sort=None, title="Purchase Likelihood"),
+                y=alt.Y('count()', title="Number of Respondents"),
+                color='purchase_likelihood',
+                tooltip=['purchase_likelihood', 'count()']
+            ).interactive()
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.warning("Column 'purchase_likelihood' not found.")
+
+    with col2:
+        st.subheader("Willingness to Pay")
+        if 'willingness_to_pay_continuous' in filtered_df.columns:
+            chart = alt.Chart(filtered_df).mark_histogram(bin=True).encode(
+                x=alt.X('willingness_to_pay_continuous', title="Willingness to Pay ($)"),
+                y=alt.Y('count()', title="Number of Respondents"),
+                tooltip=[alt.Tooltip('willingness_to_pay_continuous', bin=True), 'count()']
+            ).interactive()
+            st.altair_chart(chart, use_container_width=True)
+        else:
+            st.warning("Column 'willingness_to_pay_continuous' not found.")
+
+    st.subheader("Health Consciousness vs. Willingness to Pay")
+    if 'health_consciousness' in filtered_df.columns and 'willingness_to_pay_continuous' in filtered_df.columns:
+        scatter = alt.Chart(filtered_df).mark_circle().encode(
+            x=alt.X('health_consciousness', title='Health Consciousness (1-5)'),
+            y=alt.Y('willingness_to_pay_continuous', title='Willingness to Pay ($)'),
+            color=alt.Color('gender', title='Gender'),
+            tooltip=['age_group', 'gender', 'health_consciousness', 'willingness_to_pay_continuous']
+        ).interactive()
+        st.altair_chart(scatter, use_container_width=True)
+    else:
+        st.warning("Required columns for scatter plot not found.")
+
+# --- ML Preprocessing ---
+# Define features for models
+# We'll use a small, clear set of features for this demo
+categorical_features = ['age_group', 'gender', 'employment_status', 'health_consciousness']
+numerical_features = ['hydration_importance', 'sustainability_importance', 'early_adopter_score', 'premium_willingness_score']
+
+# Ensure all selected features exist
+all_features = categorical_features + numerical_features
+missing_features = [f for f in all_features if f not in df.columns]
+
+if not missing_features:
+    # --- Tab 2: Classification (Predict Purchase) ---
+    with tab2:
+        st.header("Classification: Predicting Purchase Likelihood")
+        st.write("We'll predict if a user is likely to purchase (1) or not (0).")
+        
+        # Define target and features
+        X = df[all_features]
+        y = df['target_purchase']
+        
+        # Handle missing values (simple imputation)
+        X[numerical_features] = X[numerical_features].fillna(X[numerical_features].mean())
+        for col in categorical_features:
+            X[col] = X[col].fillna(X[col].mode()[0])
+
+        # Create preprocessing pipeline
+        numeric_transformer = Pipeline(steps=[('scaler', StandardScaler())])
+        categorical_transformer = Pipeline(steps=[('onehot', OneHotEncoder(handle_unknown='ignore'))])
+
+        preprocessor = ColumnTransformer(
+            transformers=[
+                ('num', numeric_transformer, numerical_features),
+                ('cat', categorical_transformer, categorical_features)
+            ])
+
+        # Create the full model pipeline
+        clf_pipeline = Pipeline(steps=[
+            ('preprocessor', preprocessor),
+            ('classifier', RandomForestClassifier(random_state=42))
+        ])
+
+        # Split data and train model
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        clf_pipeline.fit(X_train, y_train)
+        
+        # Evaluate model
+        y_pred = clf_pipeline.predict(X_test)
+        accuracy = accuracy_score(y_test, y_pred)
+        
+        st.subheader("Model Performance")
+        st.write(f"**Model:** Random Forest Classifier")
+        st.write(f"**Test Accuracy:** {accuracy:.2%}")
+
+        st.subheader("Make a New Prediction")
+        # Collect user input for prediction
+        input_data = {}
+        cols = st.columns(len(all_features))
+        for i, col in enumerate(numerical_features):
+            input_data[col] = cols[i].slider(f"Input: {col}", 
+                                             float(df[col].min()), float(df[col].max()), 
+                                             float(df[col].mean()))
+        for i, col in enumerate(categorical_features):
+            input_data[col] = cols[len(numerical_features) + i].selectbox(f"Input: {col}", 
+                                                                          df[col].unique())
+        
+        # Create DataFrame for prediction
+        pred_df = pd.DataFrame(input_data, index=[0])
+        
+        # Make prediction
+        prediction = clf_pipeline.predict(pred_df)
+        prediction_proba = clf_pipeline.predict_proba(pred_df)
+        
+        if prediction[0] == 1:
+            st.success(f"**Prediction: Likely to Purchase** (Probability: {prediction_proba[0][1]:.2%})")
+        else:
+            st.error(f"**Prediction: Unlikely to Purchase** (Probability: {prediction_proba[0][0]:.2%})")
+
+
+    # --- Tab 3: Regression (Predict Willingness to Pay) ---
+    with tab3:
+        st.header("Regression: Predicting Willingness to Pay")
+        
+        # Define target and features
+        y_reg = df['willingness_to_pay_continuous'].fillna(df['willingness_to_pay_continuous'].mean())
+        X_reg = df[all_features]
+        
+        # Handle missing values
+        X_reg[numerical_features] = X_reg[numerical_features].fillna(X_reg[numerical_features].mean())
+        for col in categorical_features:
+            X_reg[col] = X_reg[col].fillna(X_reg[col].mode()[0])
+
+        # Re-use the same preprocessor from classification
+        reg_pipeline = Pipeline(steps=[
+            ('preprocessor', preprocessor),
+            ('regressor', RandomForestRegressor(random_state=42))
+        ])
+
+        # Split and train
+        X_train_reg, X_test_reg, y_train_reg, y_test_reg = train_test_split(X_reg, y_reg, test_size=0.2, random_state=42)
+        reg_pipeline.fit(X_train_reg, y_train_reg)
+        
+        # Evaluate
+        y_pred_reg = reg_pipeline.predict(X_test_reg)
+        rmse = np.sqrt(mean_squared_error(y_test_reg, y_pred_reg))
+        r2 = r2_score(y_test_reg, y_pred_reg)
+        
+        st.subheader("Model Performance")
+        st.write(f"**Model:** Random Forest Regressor")
+        st.metric(label="R-squared (R²)", value=f"{r2:.3f}")
+        st.metric(label="Root Mean Squared Error (RMSE)", value=f"${rmse:.2f}")
+
+        st.subheader("Make a New Prediction")
+        # Collect user input (can re-use the same input fields logic, but let's be explicit)
+        input_data_reg = {}
+        cols_reg = st.columns(len(all_features))
+        for i, col in enumerate(numerical_features):
+            input_data_reg[col] = cols_reg[i].slider(f"Input: {col} ", 
+                                                    float(df[col].min()), float(df[col].max()), 
+                                                    float(df[col].mean()))
+        for i, col in enumerate(categorical_features):
+            input_data_reg[col] = cols_reg[len(numerical_features) + i].selectbox(f"Input: {col} ", 
+                                                                                   df[col].unique())
+        
+        pred_df_reg = pd.DataFrame(input_data_reg, index=[0])
+        prediction_reg = reg_pipeline.predict(pred_df_reg)
+        
+        st.success(f"**Predicted Willingness to Pay: ${prediction_reg[0]:.2f}**")
+
+else:
+    # Handle case where essential features are missing
+    for tab in [tab2, tab3, tab4, tab5]:
+        with tab:
+            st.error(f"Cannot perform analysis. Missing required columns: {', '.join(missing_features)}")
+
+# --- Tab 4: Clustering ---
+with tab4:
+    st.header("Clustering: Finding Customer Segments")
+    st.write("Clustering based on attitudes and behaviors.")
+    
+    # Select features for clustering
+    cluster_features = ['health_consciousness', 'willingness_to_pay_continuous', 
+                        'early_adopter_score', 'premium_willingness_score', 
+                        'sustainability_importance', 'hydration_importance']
+    
+    # Check if features exist
+    missing_cluster_features = [f for f in cluster_features if f not in df.columns]
+    if missing_cluster_features:
+        st.error(f"Missing clustering features: {', '.join(missing_cluster_features)}")
+    else:
+        cluster_data = df[cluster_features].copy().fillna(0)
+        
+        # Scale data
+        scaler = StandardScaler()
+        cluster_data_scaled = scaler.fit_transform(cluster_data)
+        
+        # User-defined number of clusters
+        k = st.slider("Select number of clusters (k)", min_value=2, max_value=10, value=4)
+        
+        # Run K-Means
+        kmeans = KMeans(n_clusters=k, random_state=42, n_init=10)
+        cluster_data['cluster'] = kmeans.fit_predict(cluster_data_scaled)
+        
+        st.subheader(f"{k} Customer Segments")
+        
+        # Show scatter plot
+        chart = alt.Chart(cluster_data).mark_circle().encode(
+            x=alt.X('willingness_to_pay_continuous', title='Willingness to Pay ($)'),
+            y=alt.Y('health_consciousness', title='Health Consciousness (1-5)'),
+            color=alt.Color('cluster:N', title='Cluster'),
+            tooltip=cluster_features + ['cluster']
+        ).interactive()
+        st.altair_chart(chart, use_container_width=True)
+        
+        # Show cluster means
+        st.write("Average characteristics of each cluster:")
+        cluster_means = cluster_data.groupby('cluster')[cluster_features].mean()
+        st.dataframe(cluster_means)
+
+# --- Tab 5: Association Rule Mining ---
+with tab5:
+    st.header("Association Rule Mining: What Beverages are Consumed Together?")
+    
+    # Get all beverage columns
+    beverage_cols = [col for col in df.columns if col.startswith('beverage_')]
+    
+    if not beverage_cols:
+        st.error("No 'beverage_' columns found for association mining.")
+    else:
+        # Filter for rows where at least one beverage was selected
+        beverage_df = df[beverage_cols]
+        beverage_df_filtered = beverage_df[beverage_df.sum(axis=1) > 0]
+        st.write(f"Analyzing {len(beverage_df_filtered)} respondents who consume at least one beverage.")
+
+        # Convert to boolean for apriori
+        beverage_df_bool = beverage_df_filtered.astype(bool)
+
+        # Sidebar sliders for association rules
+        st.sidebar.header("Association Rule Settings")
+        min_support = st.sidebar.slider("Minimum Support", 0.01, 0.5, 0.05, 0.01)
+        min_confidence = st.sidebar.slider("Minimum Confidence", 0.1, 1.0, 0.2, 0.05)
+        
+        # Run Apriori
+        frequent_itemsets = apriori(beverage_df_bool, min_support=min_support, use_colnames=True)
+        
+        if frequent_itemsets.empty:
+            st.warning("No frequent itemsets found with the current settings. Try lowering the 'Minimum Support'.")
+        else:
+            # Generate rules
+            rules = association_rules(frequent_itemsets, metric="confidence", min_threshold=min_confidence)
+            
+            if rules.empty:
+                st.warning("No rules found with the current settings. Try lowering 'Minimum Support' or 'Minimum Confidence'.")
+            else:
+                st.subheader("Discovered Association Rules")
+                st.write("Showing rules (e.g., {A} -> {B} means 'people who drink A also drink B')")
+                
+                # Clean up rules for display
+                display_rules = rules.sort_values(by='lift', ascending=False)
+                display_rules['antecedents'] = display_rules['antecedents'].apply(lambda x: ', '.join(list(x)))
+                display_rules['consequents'] = display_rules['consequents'].apply(lambda x: ', '.join(list(x)))
+                
+                st.dataframe(display_rules[[
+                    'antecedents', 'consequents', 'support', 'confidence', 'lift'
+                ]], height=400)
